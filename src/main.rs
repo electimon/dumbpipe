@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use dumbpipe::EndpointTicket;
 use iroh::{
     endpoint::{presets, Accepting},
-    Endpoint, EndpointAddr, SecretKey,
+    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use tokio::{
@@ -136,6 +136,18 @@ pub struct CommonArgs {
     /// Otherwise, it will be parsed as a hex string.
     #[clap(long)]
     pub custom_alpn: Option<String>,
+
+    /// A relay server to use instead of the default n0 relays.
+    ///
+    /// Can be repeated to use multiple relay servers.
+    #[clap(long = "relay", value_name = "URL")]
+    pub relays: Vec<RelayUrl>,
+
+    /// Disable all relay useage.
+    ///
+    /// Will fail if used together with a `--relay` flag.
+    #[clap(long)]
+    pub disable_relays: bool,
 
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
@@ -309,6 +321,7 @@ async fn create_endpoint(
     common: &CommonArgs,
     alpns: Vec<Vec<u8>>,
 ) -> Result<Endpoint> {
+    // use default relays and other n0 default infrastructure
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(alpns);
@@ -317,6 +330,30 @@ async fn create_endpoint(
     }
     if let Some(addr) = common.ipv6_addr {
         builder = builder.bind_addr(addr)?;
+    }
+
+    match (common.disable_relays, !common.relays.is_empty()) {
+        (true, true) => {
+            // relays are disabled but the also user added custom relay URLs
+            bail_any!("`--disable-relays` flag used, but additional relay urls were added using the `--relay` flag.\nMust use one or the other.");
+        }
+        (true, false) => {
+            // relays usage is disabled
+            builder = builder.relay_mode(RelayMode::Disabled)
+        }
+        (false, true) => {
+            // user added custom relays
+            let relay_map = common
+                .relays
+                .iter()
+                .cloned()
+                .map(RelayConfig::from)
+                .collect::<RelayMap>();
+            builder = builder.relay_mode(RelayMode::Custom(relay_map));
+        }
+        (false, false) => {
+            // no flags used, use default relays added in the N0 preset
+        }
     }
     let endpoint = builder.bind().await.anyerr()?;
     Ok(endpoint)
@@ -474,11 +511,8 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         .std_context("unable to bind endpoint")?;
     tracing::info!("tcp listening on {:?}", addrs);
 
-    // Wait for our own endpoint to be ready before trying to connect.
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
-
+    // Bind before waiting for the endpoint to come online, so that tcp clients
+    // connecting early are queued instead of refused.
     let tcp_listener = match tokio::net::TcpListener::bind(addrs.as_slice()).await {
         Ok(tcp_listener) => tcp_listener,
         Err(cause) => {
@@ -486,6 +520,14 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
             return Ok(());
         }
     };
+
+    // Wait for our endpoint to be connected to a relay before trying to connect.
+    //
+    // Relays are necessary if you need to hole-punch between two
+    // devices in order to get a direct connection,
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
     async fn handle_tcp_accept(
         next: io::Result<(tokio::net::TcpStream, SocketAddr)>,
         addr: EndpointAddr,
@@ -785,16 +827,29 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
         .std_context("unable to bind endpoint")?;
     tracing::info!("unix listening on {:?}", socket_path);
 
-    // Wait for our own endpoint to be ready before trying to connect.
-    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
-        eprintln!("Warning: Failed to connect to the home relay");
-    }
-
     // Remove existing socket file if it exists
     if let Err(e) = tokio::fs::remove_file(&socket_path).await {
         if e.kind() != io::ErrorKind::NotFound {
             bail_any!("failed to remove existing socket file: {}", e);
         }
+    }
+
+    // Bind before waiting for the endpoint to come online and connecting, so
+    // that unix clients connecting early are queued instead of refused.
+    let unix_listener = UnixListener::bind(&socket_path)
+        .with_std_context(|_| format!("failed to bind Unix socket at {socket_path:?}"))?;
+    tracing::info!("bound local unix socket: {:?}", socket_path);
+
+    let _guard = UnixSocketGuard {
+        path: socket_path.clone(),
+    };
+
+    // Wait for our endpoint to be connected to a relay before trying to connect.
+    //
+    // Relays are necessary if you need to hole-punch between two
+    // devices in order to get a direct connection,
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
     }
 
     let addr = args.ticket.endpoint_addr();
@@ -804,14 +859,6 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
         .await
         .std_context("failed to connect to remote endpoint")?;
     tracing::info!("connected to remote endpoint successfully");
-
-    let unix_listener = UnixListener::bind(&socket_path)
-        .with_std_context(|_| format!("failed to bind Unix socket at {socket_path:?}"))?;
-    tracing::info!("bound local unix socket: {:?}", socket_path);
-
-    let _guard = UnixSocketGuard {
-        path: socket_path.clone(),
-    };
 
     async fn handle_unix_accept(
         next: io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
