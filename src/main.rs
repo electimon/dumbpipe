@@ -149,6 +149,12 @@ pub struct CommonArgs {
     #[clap(long)]
     pub disable_relays: bool,
 
+    /// Use minimal iroh configuration
+    ///
+    /// This causes dumbpipe to not use default N0 iroh infrastructure
+    #[clap(long)]
+    pub use_minimal_config: bool,
+
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -321,10 +327,17 @@ async fn create_endpoint(
     common: &CommonArgs,
     alpns: Vec<Vec<u8>>,
 ) -> Result<Endpoint> {
-    // use default relays and other n0 default infrastructure
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .alpns(alpns);
+    let mut builder;
+    if common.use_minimal_config {
+        builder = Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .alpns(alpns);
+    } else {
+        // use default relays and other n0 default infrastructure
+        builder = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .alpns(alpns);
+    }
     if let Some(addr) = common.ipv4_addr {
         builder = builder.bind_addr(addr)?;
     }
