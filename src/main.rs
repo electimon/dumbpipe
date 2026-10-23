@@ -9,6 +9,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use dumbpipe::EndpointTicket;
 use iroh::{
+    address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{presets, Accepting},
     Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
@@ -154,6 +155,19 @@ pub struct CommonArgs {
     /// This causes dumbpipe to not use default N0 iroh infrastructure
     #[clap(long)]
     pub use_minimal_config: bool,
+
+    /// Publish endpoint addresses to this pkarr HTTP(S) relay URL.
+    ///
+    /// Can be repeated. Use --use-minimal-config to omit the default n0 services.
+    #[clap(long = "publisher-server", value_name = "URL")]
+    pub publisher_servers: Vec<String>,
+
+    /// Resolve endpoint addresses under this DNS origin domain.
+    ///
+    /// Queries _iroh.<z32-endpoint-id>.<DOMAIN> using the system DNS resolver.
+    /// Can be repeated. Use --use-minimal-config to omit the default n0 services.
+    #[clap(long = "resolver-server", value_name = "DOMAIN")]
+    pub resolver_servers: Vec<String>,
 
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
@@ -367,6 +381,15 @@ async fn create_endpoint(
         (false, false) => {
             // no flags used, use default relays added in the N0 preset
         }
+    }
+    for server in &common.publisher_servers {
+        let url = server
+            .parse()
+            .std_context("--publisher-server requires an HTTP(S) URL, e.g. https://iroh-pkarr.yzuinfra.moe/pkarr")?;
+        builder = builder.address_lookup(PkarrPublisher::builder(url));
+    }
+    for domain in &common.resolver_servers {
+        builder = builder.address_lookup(DnsAddressLookup::builder(domain.clone()));
     }
     let endpoint = builder.bind().await.anyerr()?;
     Ok(endpoint)
